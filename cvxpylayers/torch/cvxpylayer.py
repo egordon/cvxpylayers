@@ -5,6 +5,11 @@ from cvxpy.reductions.solvers.conic_solvers.scs_conif import \
     dims_to_solver_dict
 import numpy as np
 
+
+import gin
+import multiprocessing as mp
+from functools import partial
+
 try:
     import torch
 except ImportError:
@@ -18,6 +23,7 @@ if torch_major_version < 1:
                       "version %s." % torch.__version__)
 
 
+@gin.configurable
 class CvxpyLayer(torch.nn.Module):
     """A differentiable convex optimization layer
 
@@ -54,7 +60,7 @@ class CvxpyLayer(torch.nn.Module):
         ```
     """
 
-    def __init__(self, problem, parameters, variables, gp=False):
+    def __init__(self, problem, parameters, variables, gp=False, n_proc=-1):
         """Construct a CvxpyLayer
 
         Args:
@@ -69,6 +75,13 @@ class CvxpyLayer(torch.nn.Module):
           gp: Whether to parse the problem using DGP (True or False).
         """
         super(CvxpyLayer, self).__init__()
+
+        ## Multiprocessing Pool
+        self.pool = None
+        if n_proc == -1:
+            n_proc = mp.cpu_count()
+        if n_proc > 1:
+            self.pool = mp.Pool(processes=n_proc)
 
         self.gp = gp
         if self.gp:
@@ -149,6 +162,7 @@ class CvxpyLayer(torch.nn.Module):
             dgp2dcp=self.dgp2dcp,
             solver_args=solver_args,
             info=info,
+            pool=self.pool,
         )
         sol = f(*params)
         self.info = info
@@ -175,7 +189,8 @@ def _CvxpyLayerFn(
         gp,
         dgp2dcp,
         solver_args,
-        info):
+        info,
+        pool):
     class _CvxpyLayerFnFn(torch.autograd.Function):
         @staticmethod
         def forward(ctx, *params):
@@ -268,19 +283,34 @@ def _CvxpyLayerFn(
             # canonicalize problem
             start = time.time()
             As, bs, cs, cone_dicts, ctx.shapes = [], [], [], [], []
-            for i in range(ctx.batch_size):
-                params_numpy_i = [
-                    p if sz == 0 else p[i]
-                    for p, sz in zip(params_numpy, ctx.batch_sizes)]
-                c, _, neg_A, b = compiler.apply_parameters(
-                    dict(zip(param_ids, params_numpy_i)),
-                    keep_zeros=True)
-                A = -neg_A  # cvxpy canonicalizes -A
-                As.append(A)
-                bs.append(b)
-                cs.append(c)
-                cone_dicts.append(cone_dims)
-                ctx.shapes.append(A.shape)
+
+            if pool is not None:
+                params_mp_batched = [dict(zip(param_ids, [p if sz == 0 else p[i] for p, sz in zip(params_numpy, ctx.batch_sizes)])) for i in range(ctx.batch_size)]
+                def apply_params(params):
+                    return compiler.apply_parameters(
+                        dict(zip(param_ids, params_numpy_i)),
+                        keep_zeros=True)
+                results = pool.map(partial(compiler.apply_parameters, keep_zeros=True), params_mp_batched)
+                for i in range(ctx.batch_size):
+                    cs.append(results[i][0])
+                    As.append(-results[i][2])
+                    bs.append(results[i][3])
+                    cone_dicts.append(cone_dims)
+                    ctx.shapes.append(results[i][2].shape)
+            else:  
+                for i in range(ctx.batch_size):
+                    params_numpy_i = [
+                        p if sz == 0 else p[i]
+                        for p, sz in zip(params_numpy, ctx.batch_sizes)]
+                    c, _, neg_A, b = compiler.apply_parameters(
+                        dict(zip(param_ids, params_numpy_i)),
+                        keep_zeros=True)
+                    A = -neg_A  # cvxpy canonicalizes -A
+                    As.append(A)
+                    bs.append(b)
+                    cs.append(c)
+                    cone_dicts.append(cone_dims)
+                    ctx.shapes.append(A.shape)
             info['canon_time'] = time.time() - start
 
             # compute solution (always)
