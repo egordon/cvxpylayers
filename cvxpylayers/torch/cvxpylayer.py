@@ -4,7 +4,6 @@ import cvxpy as cp
 from cvxpy.reductions.solvers.conic_solvers.scs_conif import \
     dims_to_solver_dict
 import numpy as np
-from dataclasses import dataclass
 
 
 import gin
@@ -78,7 +77,6 @@ class CvxpyLayer(torch.nn.Module):
         super(CvxpyLayer, self).__init__()
 
         ## Multiprocessing Pool
-        mp.set_start_method('spawn')
         self.pool = None
         if n_proc == -1:
             n_proc = mp.cpu_count()
@@ -180,91 +178,6 @@ def to_torch(x, dtype, device):
     # convert numpy array to torch tensor
     return torch.from_numpy(x).type(dtype).to(device)
 
-class ContextPool:
-    def __init__(self, **kwargs):
-        self.sol = kwargs["sol"]
-        self.old_params_to_new_params = kwargs["old_params_to_new_params"]
-        self.params = kwargs["params"]
-        self.batch = kwargs["batch"]
-        self.batch_size = kwargs["batch_size"]
-        self.batch_sizes = kwargs["batch_sizes"]
-        self.shapes = kwargs["shapes"]
-        self.DT_batch = kwargs["DT_batch"]
-        self.dtype = kwargs["dtype"]
-        self.device = kwargs["device"]
-
-class _CvxpyLayerFnFnBackVmap(torch.autograd.Function):
-    @staticmethod
-    def setup_context(ctx, inputs, output):
-        pass
-    @staticmethod
-    def vmap(info, in_dims, ctx, gp, variables, compiler, param_ids, info_dict, pool, *dvars):
-        in_dims_real = in_dims[7:]
-        assert len(in_dims_real) == 1
-        dvar = dvars[0]
-        ctx_pool = ContextPool(sol=ctx.sol if gp else None, old_params_to_new_params=ctx.old_params_to_new_params if gp else None, params=ctx.params if gp else None,
-            batch=ctx.batch, batch_size=ctx.batch_size, batch_sizes=ctx.batch_sizes, shapes=ctx.shapes, DT_batch=ctx.DT_batch, dtype=ctx.dtype, device=ctx.device)
-        ret_list = list(map(partial(_CvxpyLayerFnFnBackVmap.apply, ctx_pool, gp, variables, compiler, param_ids, info_dict, None), [dvar[bat] for bat in range(info.batch_size)]))
-        ret_tup = tuple(torch.stack([ret[idx] for ret in ret_list]) for idx in range(len(ret_list[0])))
-
-        return ret_tup, tuple([0] * len(ret_tup))
-
-    @staticmethod
-    def forward(ctx, gp, variables, compiler, param_ids, info_dict, pool, *dvars):
-        if gp:
-            # derivative of exponential recovery transformation
-            dvars = [dvar*s for dvar, s in zip(dvars, ctx.sol)]
-
-        dvars_numpy = [to_numpy(dvar) for dvar in dvars]
-
-        if not ctx.batch:
-            dvars_numpy = [np.expand_dims(dvar, 0) for dvar in dvars_numpy]
-
-        # differentiate from cvxpy variables to cone problem data
-        dxs, dys, dss = [], [], []
-        for i in range(ctx.batch_size):
-            del_vars = {}
-            for v, dv in zip(variables, [dv[i] for dv in dvars_numpy]):
-                del_vars[v.id] = dv
-            dxs.append(compiler.split_adjoint(del_vars))
-            dys.append(np.zeros(ctx.shapes[i][0]))
-            dss.append(np.zeros(ctx.shapes[i][0]))
-
-        dAs, dbs, dcs = ctx.DT_batch(dxs, dys, dss)
-
-        # differentiate from cone problem data to cvxpy parameters
-        start = time.time()
-        grad = [[] for _ in range(len(param_ids))]
-        for i in range(ctx.batch_size):
-            del_param_dict = compiler.apply_param_jac(
-                dcs[i], -dAs[i], dbs[i])
-            for j, pid in enumerate(param_ids):
-                grad[j] += [to_torch(del_param_dict[pid],
-                                     ctx.dtype, ctx.device).unsqueeze(0)]
-        grad = [torch.cat(g, 0) for g in grad]
-
-        if gp:
-            # differentiate through the log transformation of params
-            dcp_grad = grad
-            grad = []
-            dparams = {pid: g for pid, g in zip(param_ids, dcp_grad)}
-            for param, value in zip(param_order, ctx.params):
-                g = 0.0 if param.id not in dparams else dparams[param.id]
-                if param in ctx.old_params_to_new_params:
-                    dcp_param_id = ctx.old_params_to_new_params[param].id
-                    # new_param.value == log(param), apply chain rule
-                    g += (1.0 / value) * dparams[dcp_param_id]
-                grad.append(g)
-        info_dict['dcanon_time'] = time.time() - start
-
-        if not ctx.batch:
-            grad = [g.squeeze(0) for g in grad]
-        else:
-            for i, sz in enumerate(ctx.batch_sizes):
-                if sz == 0:
-                    grad[i] = grad[i].sum(dim=0)
-
-        return tuple(grad)
 
 def _CvxpyLayerFn(
         param_order,
@@ -278,6 +191,78 @@ def _CvxpyLayerFn(
         solver_args,
         info,
         pool):
+    class _CvxpyLayerFnFnBackVmap(torch.autograd.Function):
+        @staticmethod
+        def setup_context(ctx, inputs, output):
+            pass
+        @staticmethod
+        def vmap(info, in_dims, ctx, *dvars):
+            in_dims_real = in_dims[1:]
+            ret_list = []
+            for bat in range(info.batch_size):
+                for dim, dvar in zip(in_dims_real, dvars):
+                    assert dim == 0
+                    ret_list.append(_CvxpyLayerFnFnBackVmap.apply(ctx, dvar[bat]))
+            ret_tup = tuple(torch.stack([ret[idx] for ret in ret_list]) for idx in range(len(ret_list[0])))
+
+            return ret_tup, tuple([0] * len(ret_tup))
+
+        @staticmethod
+        def forward(ctx, *dvars):
+            if gp:
+                # derivative of exponential recovery transformation
+                dvars = [dvar*s for dvar, s in zip(dvars, ctx.sol)]
+
+            dvars_numpy = [to_numpy(dvar) for dvar in dvars]
+
+            if not ctx.batch:
+                dvars_numpy = [np.expand_dims(dvar, 0) for dvar in dvars_numpy]
+
+            # differentiate from cvxpy variables to cone problem data
+            dxs, dys, dss = [], [], []
+            for i in range(ctx.batch_size):
+                del_vars = {}
+                for v, dv in zip(variables, [dv[i] for dv in dvars_numpy]):
+                    del_vars[v.id] = dv
+                dxs.append(compiler.split_adjoint(del_vars))
+                dys.append(np.zeros(ctx.shapes[i][0]))
+                dss.append(np.zeros(ctx.shapes[i][0]))
+
+            dAs, dbs, dcs = ctx.DT_batch(dxs, dys, dss)
+
+            # differentiate from cone problem data to cvxpy parameters
+            start = time.time()
+            grad = [[] for _ in range(len(param_ids))]
+            for i in range(ctx.batch_size):
+                del_param_dict = compiler.apply_param_jac(
+                    dcs[i], -dAs[i], dbs[i])
+                for j, pid in enumerate(param_ids):
+                    grad[j] += [to_torch(del_param_dict[pid],
+                                         ctx.dtype, ctx.device).unsqueeze(0)]
+            grad = [torch.cat(g, 0) for g in grad]
+
+            if gp:
+                # differentiate through the log transformation of params
+                dcp_grad = grad
+                grad = []
+                dparams = {pid: g for pid, g in zip(param_ids, dcp_grad)}
+                for param, value in zip(param_order, ctx.params):
+                    g = 0.0 if param.id not in dparams else dparams[param.id]
+                    if param in ctx.old_params_to_new_params:
+                        dcp_param_id = ctx.old_params_to_new_params[param].id
+                        # new_param.value == log(param), apply chain rule
+                        g += (1.0 / value) * dparams[dcp_param_id]
+                    grad.append(g)
+            info['dcanon_time'] = time.time() - start
+
+            if not ctx.batch:
+                grad = [g.squeeze(0) for g in grad]
+            else:
+                for i, sz in enumerate(ctx.batch_sizes):
+                    if sz == 0:
+                        grad[i] = grad[i].sum(dim=0)
+
+            return tuple(grad)
     class _CvxpyLayerFnFn(torch.autograd.Function):
         @staticmethod
         def forward(ctx, *params):
@@ -373,6 +358,10 @@ def _CvxpyLayerFn(
 
             if pool is not None:
                 params_mp_batched = [dict(zip(param_ids, [p if sz == 0 else p[i] for p, sz in zip(params_numpy, ctx.batch_sizes)])) for i in range(ctx.batch_size)]
+                def apply_params(params):
+                    return compiler.apply_parameters(
+                        dict(zip(param_ids, params_numpy_i)),
+                        keep_zeros=True)
                 results = pool.map(partial(compiler.apply_parameters, keep_zeros=True), params_mp_batched)
                 for i in range(ctx.batch_size):
                     cs.append(results[i][0])
@@ -437,6 +426,6 @@ def _CvxpyLayerFn(
 
         @staticmethod
         def backward(ctx, *dvars):
-            return _CvxpyLayerFnFnBackVmap.apply(ctx, gp, variables, compiler, param_ids, info, pool, *dvars)
+            return _CvxpyLayerFnFnBackVmap.apply(ctx, *dvars)
 
     return _CvxpyLayerFnFn.apply
