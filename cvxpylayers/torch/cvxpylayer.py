@@ -7,7 +7,7 @@ import numpy as np
 
 
 import gin
-from pathos.helpers import mp
+import multiprocessing as mp
 from functools import partial
 
 try:
@@ -236,9 +236,14 @@ def _CvxpyLayerFn(
             # differentiate from cone problem data to cvxpy parameters
             start = time.time()
             grad = [[] for _ in range(len(param_ids))]
-            for i in range(ctx.batch_size):
-                del_param_dict = compiler.apply_param_jac(
-                    dcs[i], -dAs[i], dbs[i])
+            del_param_dicts = []
+            if pool is not None:
+                del_param_dicts = pool.starmap(compiler.apply_param_jac, zip(dcs, [-dA for dA in dAs], dbs))
+            else:
+                for i in range(ctx.batch_size):
+                    del_param_dicts.append(compiler.apply_param_jac(
+                        dcs[i], -dAs[i], dbs[i]))
+            for del_param_dict in del_param_dicts:
                 for j, pid in enumerate(param_ids):
                     grad[j] += [to_torch(del_param_dict[pid],
                                          ctx.dtype, ctx.device).unsqueeze(0)]
@@ -361,10 +366,6 @@ def _CvxpyLayerFn(
 
             if pool is not None:
                 params_mp_batched = [dict(zip(param_ids, [p if sz == 0 else p[i] for p, sz in zip(params_numpy, ctx.batch_sizes)])) for i in range(ctx.batch_size)]
-                def apply_params(params):
-                    return compiler.apply_parameters(
-                        dict(zip(param_ids, params_numpy_i)),
-                        keep_zeros=True)
                 results = pool.map(partial(compiler.apply_parameters, keep_zeros=True), params_mp_batched)
                 for i in range(ctx.batch_size):
                     cs.append(results[i][0])
