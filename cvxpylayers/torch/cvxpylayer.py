@@ -7,7 +7,7 @@ import numpy as np
 
 
 import gin
-import multiprocessing as mp
+from pathos.helpers import mp
 from functools import partial
 
 try:
@@ -81,7 +81,7 @@ class CvxpyLayer(torch.nn.Module):
         if n_proc == -1:
             n_proc = mp.cpu_count()
         if n_proc > 1:
-            self.pool = mp.Pool(processes=n_proc)
+            self.pool = mp.Pool(n_proc)
 
         self.gp = gp
         if self.gp:
@@ -197,14 +197,17 @@ def _CvxpyLayerFn(
             pass
         @staticmethod
         def vmap(info, in_dims, ctx, *dvars):
-            in_dims_real = in_dims[1:]
-            ret_list = []
-            for bat in range(info.batch_size):
-                for dim, dvar in zip(in_dims_real, dvars):
-                    assert dim == 0
-                    ret_list.append(_CvxpyLayerFnFnBackVmap.apply(ctx, dvar[bat]))
-            ret_tup = tuple(torch.stack([ret[idx] for ret in ret_list]) for idx in range(len(ret_list[0])))
-
+            # TODO: Assumes in_dims == 0 for everything
+            batch_dvars = tuple(dvar.view(1, -1, *(dvar.size()[2:])).squeeze(0) for dvar in dvars)
+            ctx.batch_size = ctx.batch_size * info.batch_size
+            ctx.batch_sizes = ctx.batch_sizes * info.batch_size
+            ctx.shapes = ctx.shapes * info.batch_size
+            ret_int = _CvxpyLayerFnFnBackVmap.apply(ctx, *batch_dvars)
+            ret_tup = tuple(ret.view(info.batch_size, -1, *(ret.size()[1:])) for ret in ret_int)
+            # Reset context
+            ctx.batch_size = ctx.batch_size // info.batch_size
+            ctx.batch_sizes = ctx.batch_sizes // info.batch_size
+            ctx.shapes = ctx.shapes[:int(len(ctx.shapes)//info.batch_size)]
             return ret_tup, tuple([0] * len(ret_tup))
 
         @staticmethod
